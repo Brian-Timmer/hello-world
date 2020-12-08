@@ -1,0 +1,532 @@
+---
+title: "Final project"
+author: "Brian Timmer"
+date: "November 15, 2020"
+output: html_document
+---
+
+First load all of the packages you might need
+```{r}
+library(gridExtra)
+library(grid)
+library(gtable)
+library(lubridate)
+library(rgdal)
+library(spatstat)  
+library(maptools)  
+library(tmap)
+library(gstat)
+library(raster)  
+library(sp)
+library(spgwr)
+library(sf)
+library(e1071)
+library(spdep)
+library(ggplot2)
+```
+
+set WD and load in VRI data
+```{r}
+#Set working directory
+dir <- "C:\\Users\\Brian\\Desktop\\MSc Classes\\Geog518 - R spatial data\\FinalAss\\VRI"
+setwd(dir)
+
+#Reading in elevation dataset
+elev <- readOGR('ElevSample.shp') #Read in data
+elev <- spTransform(elev, CRS("+init=epsg:26910"))
+
+#Reading in VRI data
+VRI <- readOGR('WatershedVRI.shp') #Read in shapefile
+VRI <- spTransform(VRI, CRS("+init=epsg:26910"))
+#head(VRI@data)
+
+```
+metadata for VRI
+```{r}
+#Meta Data (https://www2.gov.bc.ca/assets/gov/farming-natural-resources-and-industry/forestry/stewardship/forest-analysis-inventory/data-management/standards/vegcomp_poly_rank1_data_dictionaryv5_2019.pdf)
+# FID = Field ID
+# PolyID = VRI Polygon ID
+# Stand_Age = Estimated stand age projected to 2020 from estimated establishment date
+# Site_Index = A value to estimate site quality. This describes the height that the stand could grow to by age 50 in meters.
+# CoDom_Sp = The species code for the co-dominant tree species. Full list of codes: https://www.for.gov.bc.ca/hfp/publications/00026/fs708-14-appendix_d.htm
+# Dom_Sp = The species code for the dominant tree species. Full list of codes: https://www.for.gov.bc.ca/hfp/publications/00026/fs708-14-appendix_d.htm
+
+# Stand_HT = The estimated height for the stand
+# DomSP_Perc = The estimated percentage of the dominent species
+# CDomSP_Perc = The estimated percentage of the co-dominent species
+# Stand_Dens = Estimated density of stand (Stems per hectare)
+# Stand_BA = Estimated Basal area of the stand (square meters)
+# Stand_StemBio = Estimated stand level stem biomass (tonnes per hectare)
+# Stand_CrownCl = The percentage of ground area covered by tree crowns
+```
+
+clean up columns and change names. also remove NA from water
+```{r}
+vriCleanCols <- c("FID_VEG_CO", "POLYGON_ID", "PROJ_AGE_1",
+                  "SITE_INDEX", "SPECIES__4", "SPECIES__5",
+                  "PROJ_HEI_1", "SPECIES_PC", "SPECIES__6",
+                  "VRI_LIVE_S", "BASAL_AREA", "WHOLE_STEM",
+                  "CROWN_CL_1")
+
+vriClean <- VRI[,vriCleanCols]
+
+newNames <- c("FID", "PolyID", "Stand_Age", "Site_Index",
+              "CoDom_Sp", "Dom_Sp", "Stand_HT", "DomSP_Perc", 
+              "CDomSP_Perc", "Stand_Dens", "Stand_BA", "Stand_StemBio", "Stand_CrownCl")
+
+colnames(vriClean@data) <- newNames
+
+#filter out any polygon without a species name, i.e., water or clearcut
+vriClean_Data <- vriClean[!is.na(vriClean@data$Dom_Sp), ]
+```
+check out a cloropleth map of standbiomass, also plot elevation points. note that some points are outside the polygons, this may not mater for now but likely will get clipped at some point.
+```{r}
+#Create choropleth map of height
+map_Bio <- tm_shape(vriClean_Data) +
+  tm_polygons(col = "Stand_StemBio",
+              title = "Stemwood \nBiomass \n(tonnes/ha)",
+              breaks = c(0,200,400,600,800,1000),
+              palette = "viridis", n = 5)+
+    tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))+
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))
+
+map_Bio
+
+P1 <- tm_shape(vriClean_Data) + 
+  tm_polygons() +
+  tm_shape(elev) +
+  tm_dots(col="grid_code", palette = "YlOrRd", 
+          title="elevation", size=0.7) + 
+  tm_legend(legend.outside=TRUE)+
+  tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))
+
+P1
+```
+run the descriptive stats on data
+```{r}
+mean_elev <- mean(elev$grid_code)
+sd_elev <- sd(elev$grid_code)
+skew_elev <- skewness(elev$grid_code, na.rm = TRUE)
+kurt_elev <- kurtosis(elev$grid_code, na.rm = TRUE)
+CoV_elev <- (sd_elev / mean_elev) * 100
+norm_elev_PVAL <- shapiro.test(elev$grid_code)$p.value
+
+summary_elev <- summary(elev$grid_code)
+
+summary(vriClean_Data$Stand_StemBio)
+
+VRI_AREA <- rgeos::gArea(vriClean_Data)
+
+VRI_AREA/1000000
+
+elev_data <- as.data.frame(elev$grid_code)
+histogram_elev <- ggplot(elev_data, aes(x = elev$grid_code)) + #Create new GGplot object with data attached and fire size mapped to X axis
+  geom_histogram(bins = 30, color = "black", fill = "white") + #make histogram with 30 bins, black outline, white fill
+  labs(title = "elevation", x = "elevation", y = "Frequency", caption = "Figure 1: elevs. ") + #label plot, x axis, y axis
+  theme_classic() + #set the theme to classic (removes background and borders etc.)
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0.5)) + #set title to center and bold
+  scale_y_continuous(breaks = seq(0, 400, by = 100))# set y axis labels to 0 - 700 incrimenting by 100
+histogram_elev
+```
+now we need to check if the pattern in dispersed or clustered (point pattern analysis)
+
+```{r}
+#first we need to clip the points to the polygon make ppp object so we take the coordinates of out point data
+newpoints <- elev[vriClean_Data,]
+#create extent matrix for window
+elev.ext <- as.matrix(extent(newpoints)) 
+
+#observation window
+window_area <- as.owin(list(xrange = elev.ext[1,], yrange = elev.ext[2,]))
+
+#pull coordinates of all points
+newpoints$x <- coordinates(newpoints)[,1]
+newpoints$y <- coordinates(newpoints)[,2]
+
+#create ppp
+newpoints.ppp <- ppp(x = newpoints$x, y = newpoints$y, window = window_area)
+
+#run nearest neighbour analysis
+nearestNeighbour_elev <- nndist(newpoints.ppp)
+
+nearestNeighbour_elev=as.data.frame(as.numeric(nearestNeighbour_elev))
+##Change the column name to "Distance"
+colnames(nearestNeighbour_elev) = "Distance"
+nearestNeighbour_elev <- nearestNeighbour_elev/1000
+
+nnd_elev = sum(nearestNeighbour_elev$Distance)/nrow(nearestNeighbour_elev)
+
+VRI_AREA <- rgeos::gArea(vriClean_Data)
+VRI_AREA <- VRI_AREA/1000000
+ pointDensity_elev <-317/VRI_AREA
+  
+  r.nnd_elev = 1/(2*sqrt(pointDensity_elev))
+  
+  d.nnd_elev = 1.07453/(sqrt(pointDensity_elev))
+  
+  R_elev = nnd_elev/r.nnd_elev
+  
+  SE.NND_elev <- 0.26136/(sqrt(nrow(nearestNeighbour_elev)*pointDensity_elev))
+  
+  z_elev = (nnd_elev-r.nnd_elev)/SE.NND_elev
+
+
+
+```
+
+
+create a grid for interpolation
+```{r}
+#Create a grid called grd to use in your interpolation
+# Create an empty grid where n is the total number of cells
+grd <- as.data.frame(spsample(elev, "regular", n=50000))
+names(grd)       <- c("X", "Y")
+coordinates(grd) <- c("X", "Y")
+gridded(grd)     <- TRUE  # Create SpatialPixel object
+fullgrid(grd)    <- TRUE  # Create SpatialGrid object
+proj4string(grd) <- proj4string(vriClean_Data)
+
+##################################################
+
+#VRI_total <- raster::intersect(vriClean_Data, elev)
+VRI_elev <- elev$grid_code
+
+# Define the trend model
+f.1 <- as.formula(grid_code ~ 1)
+
+P.idw4 <- gstat::idw(grid_code~1, elev, newdata=grd, idp=4)
+r4      <- raster(P.idw4)
+r.m4     <- mask(r4, vriClean_Data)
+P.idw3 <- gstat::idw(grid_code~1, elev, newdata=grd, idp=3)
+r3       <- raster(P.idw3)
+r.m3     <- mask(r3, vriClean_Data)
+P.idw2 <- gstat::idw(grid_code~1, elev, newdata=grd, idp=2)
+r2       <- raster(P.idw2)
+r.m2     <- mask(r2, vriClean_Data)
+P.idw5 <- gstat::idw(grid_code~1, elev, newdata=grd, idp=5)
+r5       <- raster(P.idw5)
+r.m5     <- mask(r5, vriClean_Data)
+
+tm <-tm_shape(r.m4) + 
+  tm_raster(n=10,palette = "YlOrRd",
+            title="Predicted elevation(m)") + 
+  tm_shape(elev) + tm_dots(size=0.05) +
+  tm_legend(legend.outside=TRUE)+
+  tm_layout(title="IDP = 4")+
+  tm_compass(position=c("right", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))
+tm
+
+IDW.out <- vector(length = length(elev))
+for (i in 1:length(elev)) {
+  IDW.out[i] <- idw(grid_code ~ 1, elev[-i,], elev[i,], idp=4)$var1.pred
+}
+
+
+
+
+sqrt( sum((IDW.out - elev$grid_code)^2) / length(elev))
+# Plot the differences
+OP <- par(pty="s", mar=c(4,3,1,0))
+plot(IDW.out ~ elev$grid_code, asp=1, main ="IDP = 4, RMSE = 50.9", xlab="Observed", ylab="Predicted", pch=16,
+     col=rgb(0,0,0,0.5))
+abline(lm(IDW.out ~ elev$grid_code), col="red", lw=2,lty=2)
+abline(0,1)
+par(OP)
+#IDP2=RMSE74.8
+#IDP3=RMSE 53.5
+#IDP4 = RMSE 50.9
+#IDP5=RMSE 51.5
+#IDP6=RSME 52.68
+#IDP7=RSME 53.82
+# this is the RMSE in the units of the values 
+#see how the red line changes as we change the p parameter
+
+img <- gstat::idw(grid_code~1, elev, newdata=grd, idp=4)
+n   <- length(elev)
+Zi  <- matrix(nrow = length(img$var1.pred), ncol = n)
+
+# Remove a point then interpolate (do this n times for each point)
+st <- stack()
+for (i in 1:n){
+  Z1 <- gstat::idw(grid_code~1, elev[-i,], newdata=grd, idp=4)
+  st <- addLayer(st,raster(Z1,layer=1))
+  # Calculated pseudo-value Z at j
+  Zi[,i] <- n * img$var1.pred - (n-1) * Z1$var1.pred
+}
+
+
+# Jackknife estimator of parameter Z at location j
+Zj <- as.matrix(apply(Zi, 1, sum, na.rm=T) / n )
+
+# Compute (Zi* - Zj)^2
+c1 <- apply(Zi,2,'-',Zj)            # Compute the difference
+c1 <- apply(c1^2, 1, sum, na.rm=T ) # Sum the square of the difference
+
+# Compute the confidence interval
+CI <- sqrt( 1/(n*(n-1)) * c1)
+
+# Create (CI / interpolated value) raster
+img.sig   <- img
+img.sig$v <- CI /img$var1.pred 
+
+# Clip the confidence raster to Southern California
+r <- raster(img.sig, layer="v")
+r.m <- mask(r, vriClean_Data)
+#?tm_legend()
+# Plot the map
+jk <- tm_shape(r.m) + tm_raster()+#breaks = c(0,.1,.2,.3,.4,.5,.6,.7,.8,.9,1), title = expression("95% CI(??g/m"^3*")")) +
+  tm_shape(vriClean_Data) + tm_dots(size=0.2) +
+  tm_legend(legend.outside=TRUE )#+
+ # tm_layout(title="IDP = 4 \n, title.size = 5)
+
+tmap_save(jk, filename = "IDP-4_jacknife.png") 
+
+```
+
+
+
+plot elevation polygons
+```{r}
+map_elev <- tm_shape(vriClean_Data) +
+  tm_polygons(col = "Elev",
+              title = "Elevation (m)",
+              style = "jenks",
+              palette = "viridis", n = 10) +
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))
+
+map_elev
+```
+
+next we need to check if the biomass is spatially autocorrelated by running a global moran's I:
+
+setqueen weighting scheme and standardized spatial weighting
+```{r}
+vri.nb_Data <- poly2nb(vriClean_Data, queen = TRUE)
+vri.net_Data <- nb2lines(vri.nb_Data, coords=coordinates(vriClean_Data))
+crs(vri.net_Data) <- crs(vriClean_Data)
+
+#tm_shape(vriClean_Data) + tm_borders(col='lightgrey') + 
+#  tm_shape(vri.net_Data) + tm_lines(col='red')+
+#  tm_compass(position=c("right", "top"))+
+#  tm_scale_bar(position=c("left", "bottom"))+
+#  tm_layout(title = "a)", title.position = c("left", "top"))
+
+vri.lw_queen_W <- nb2listw(vri.nb_Data, zero.policy = TRUE, style = "W")
+print.listw(vri.lw_queen_W, zero.policy = TRUE)
+```
+
+next set calculate the morans i information 
+```{r}
+mi_BIO_queen_w <- moran.test(vriClean_Data$Stand_StemBio, vri.lw_queen_W, zero.policy = TRUE)
+#mi_BIO_queen_w
+```
+we also need to calculate the moran's range
+```{r}
+moran.range <- function(lw) {
+  wmat <- listw2mat(lw)
+  return(range(eigen((wmat + t(wmat))/2)$values))
+}
+moran.range(vri.lw_queen_W)
+
+```
+finally, z score
+
+```{r}
+
+mI_BIO_queen_w <- mi_BIO_queen_w$estimate[[1]]
+eI_BIO_queen_w <- mi_BIO_queen_w$estimate[[2]]
+var_BIO_queen_w <- mi_BIO_queen_w$estimate[[3]]
+
+z_BIO_queen_w <- (mI_BIO_queen_w - eI_BIO_queen_w)/sqrt(var_BIO_queen_w)
+```
+
+next a local morans i
+```{r}
+lisa.test_BIO_queen <- localmoran(vriClean_Data$Stand_StemBio, vri.lw_queen_W)
+
+vriClean_Data$BIO_Ii <- lisa.test_BIO_queen[,1]#this takes the whole column bcause the lisa test is local and gives a bunch of values... look into one or two tailed for p test....
+vriClean_Data$BIO_E.Ii<- lisa.test_BIO_queen[,2]
+vriClean_Data$BIO_Var.Ii<- lisa.test_BIO_queen[,3]
+vriClean_Data$BIO_Z.Ii<- lisa.test_BIO_queen[,4]
+vriClean_Data$BIO_P<- lisa.test_BIO_queen[,5]
+########################
+summary(vriClean_Data$BIO_Z.Ii)
+
+map_LISA_HT <- tm_shape(vriClean_Data) + 
+  tm_polygons(col = "HTIi", 
+              title = "a) Local Moran's I", 
+              style = "fixed",
+              midpoint = NA,
+              colorNA = NULL,
+              breaks = c(-5,-3,-1,1,3,5,7,9,11),
+              palette = "RdBu", n = 8)+
+  tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))+
+  tm_legend(position = c("right", "top"))
+
+map_LISA_HT
+
+map_LISA_HT_Z <- tm_shape(vriClean_Data) + 
+  tm_polygons(col = "BIO_Z.Ii", 
+              title = "Local Z-scores", 
+              style = "fixed",
+              midpoint = NA,
+              colorNA = NULL,
+             # style = "jenks", 
+              #palette = "Set1", n = 12)+
+              breaks = c(-30.9,-1.96,1.96,32.1),
+              palette = "RdYlBu", n = 3, contrast = c(0, 0.9))+
+  tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))+
+  tm_legend(position = c("right", "top"))
+
+map_LISA_HT_Z
+```
+
+
+regression and residual evaluation
+```{r}
+######Linear Regression##########
+#Let's say your dataset with both Elev and Height are stored in a dataset called VRI.
+#Plot Height and Elev from the VRI dataset you created
+plot(vriClean_Data$Stand_StemBio ~ vriClean_Data$Elev)
+
+#Notice that there are a lot of 0's in this dataset. If you decide to remove them, use the following line:
+#VRI.no0 <-  vriClean_Data[which(vriClean_Data$Stand_StemBio > 0), ]
+#VRI.no0 <-  VRI.no0[which(VRI.no0$Elev > 0), ]
+
+#Now plot the data again
+plot(VRI.no0$Stand_StemBio ~ VRI.no0$Elev)
+
+#Perform a linear regression on the two variables. You should decide which one is dependent.
+lm.model <- lm(vriClean_Data$Stand_StemBio ~ vriClean_Data$Elev)
+
+#Add the regression model to the plot you created
+plot(vriClean_Data$Stand_StemBio ~ vriClean_Data$Elev)
+abline(lm.model, col = "red")
+
+#Get the summary of the results
+summary(lm.model)
+
+#add the fitted values to your spatialpolygon dataframe
+VRI.no0$predictlm <- lm.model$fitted.values
+
+#You want to determine if the model residuals are spatially clustered. 
+#add the residuals to your spatialpolygon dataframe
+vriClean_Data$residuals <- residuals.lm(lm.model)
+
+#Observe the result to make sure it looks correct
+#head(VRI.no0@data)
+
+#Now, create choropleth map of residuals
+map_resid <- tm_shape(vriClean_Data) +
+  tm_polygons(col = "residuals",
+              title = "Stand Biomass Residuals",
+              style = "jenks",
+              palette = "viridis", n = 6)
+
+map_resid
+##################################################
+
+mi_res_queen_w <- moran.test(vriClean_Data$residuals, vri.lw_queen_W, zero.policy = TRUE)
+
+mI_res_queen_w <- mi_res_queen_w$estimate[[1]]
+eI_res_queen_w <- mi_res_queen_w$estimate[[2]]
+var_res_queen_w <- mi_res_queen_w$estimate[[3]]
+
+z_res_queen_w <- (mI_res_queen_w - eI_res_queen_w)/sqrt(var_res_queen_w)
+
+```
+
+Finally, geographically weighted regression
+
+
+```{r}
+####Geographically Weighted Regression
+#Let's say you are continuing with 
+#your data from the regression analysis. 
+#The first thing you need to do is to add the 
+#polygon coordinates to the spatialpolygondataframe.
+#You can obtain the coordinates using the 
+#"coordinates" function from the sp library
+vriClean_Data.coords <- sp::coordinates(vriClean_Data)
+#Observe the result:
+head(vriClean_Data.coords)
+#Now add the coordinates back to the spatialpolygondataframe
+vriClean_Data$X <- vriClean_Data.coords[,1]
+vriClean_Data$Y <- vriClean_Data.coords[,2]
+
+###Determine the bandwidth for GWR: this will take a while
+GWRbandwidth <- gwr.sel(vriClean_Data$Stand_StemBio ~ vriClean_Data$Elev, 
+                        data=vriClean_Data, coords=cbind(vriClean_Data$X,vriClean_Data$Y),adapt=T) 
+?gwr.sel()
+###Perform GWR on the two variables with the bandwidth determined above
+###This will take a looooooong while
+gwr.model = gwr(vriClean_Data$Stand_StemBio ~ vriClean_Data$Elev, 
+                data=vriClean_Data, coords=cbind(vriClean_Data$X,vriClean_Data$Y), 
+                adapt=GWRbandwidth, hatmatrix=TRUE, se.fit=TRUE) 
+?gwr()
+gwr.model$bandwidth
+#Print the results of the model
+gwr.model
+
+#Look at the results in detail
+results<-as.data.frame(gwr.model$SDF)
+head(results)
+?gwr
+#Now for the magic. Let's add our local r-square values to the map
+vriClean_Data$localr <- results$localR2
+
+#Create choropleth map of r-square values
+map_r2 <- tm_shape(vriClean_Data) +
+  tm_polygons(col = "localr",
+              title = "R2 values",
+              breaks = c(-1.9,0,0.2,0.4,0.6,0.8,1),
+              palette = "RdYlBu", n = 6, midpoint = NA)+
+  tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))+
+  tm_legend(legend.position = c("LEFT", "BOTTOM"))
+map_r2
+names(gwr.model)
+names(results)
+#Time for more magic. Let's map the coefficients
+vriClean_Data$coeff <- results$vriClean_Data.Elev
+summary(vriClean_Data$coeff)
+#Create choropleth map of the coefficients
+map_coef <- tm_shape(vriClean_Data) +
+  tm_polygons(col = "coeff",
+              title = "Coefficients",
+              breaks = c(-153,-20,-15,-10, -5,0,5,10,15,20,215),
+              palette = "RdYlBu", n = 10)+
+  tm_compass(position=c("left", "top"))+
+  tm_scale_bar(position=c("left", "bottom"))+
+  tm_legend(legend.position = c("right", "top"))
+map_coef
+
+hist(vriClean_Data$coeff)
+mi_BIO_queen_w
+
+
+histogram_r2 <- ggplot(results, aes(x = localR2)) + 
+  xlim(c(-1, 1))+#Create new GGplot object with data attached and fire size mapped to X axis
+  geom_histogram(color = "black", fill = "white", binwidth=0.1) + #make histogram with 30 bins, black outline, white fill
+  labs( x = "correlation coefficients", y = "Frequency")+#, caption = "Figure 2: Frequency distribution of regression coefficient values from geographically weighted regression of stem biomass and elevation in the GVWSA.") + #label plot, x axis, y axis
+  theme_classic() + #set the theme to classic (removes background and borders etc.)
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0.5)) + #set title to center and bold
+  scale_y_continuous(breaks = seq(0, 3500, by = 500))# set y axis labels to 0 - 700 incrimenting by 100
+histogram_r2
+
+
+histogram_coeff <- ggplot(results, aes(x = vriClean_Data.Elev)) + 
+  xlim(c(-20, 20))+#Create new GGplot object with data attached and fire size mapped to X axis
+  geom_histogram(color = "black", fill = "white", binwidth=0.5) + #make histogram with 30 bins, black outline, white fill
+  labs( x = "Regression coefficient values", y = "Frequency")+#, caption = "Figure 2: Frequency distribution of regression coefficient values from geographically weighted regression of stem biomass and elevation in the GVWSA.") + #label plot, x axis, y axis
+  theme_classic() + #set the theme to classic (removes background and borders etc.)
+  theme(plot.title = element_text(face = "bold", hjust = 0.5), plot.caption = element_text(hjust = 0.5)) + #set title to center and bold
+  scale_y_continuous(breaks = seq(0, 2000, by = 500))# set y axis labels to 0 - 700 incrimenting by 100
+histogram_coeff
+```
+
